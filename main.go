@@ -15,8 +15,9 @@ type Char struct {
 	v byte
 }
 
+// members are decremented upon compression and incremented after decompressed 
 type Ptr struct {
-	back uint // will have to be subtracted by one when compressing, add one back when de compressing
+	back uint 
 	len byte
 }	
 
