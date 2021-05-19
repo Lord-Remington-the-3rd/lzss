@@ -1,348 +1,279 @@
 package main
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
-	"os"
 	"io/ioutil"
-	"strings"
+	"os"
 )
 
-type Unit interface {
-	Bytes() []byte
-}
-	
-type Char struct {
-	v byte
-}
+const PTR byte = 1
+const BYTE byte = 0
 
-// members are decremented upon compression and incremented after decompressed 
-type Ptr struct {
-	back uint 
-	len byte
-}	
-
-type CharStr struct {
-	index uint
-	str []Char
+type InMemoryOutput struct {
+	Headers              []byte
+	currentHeaderByteLen int
+	Data                 []byte
 }
 
-func (c Char) Bytes() []byte {
-	return []byte{c.v}
+func NewInMemoryOutput() InMemoryOutput {
+	return InMemoryOutput{
+		Headers: make([]byte, 1),
+	}
 }
 
-func (c Ptr) Bytes() []byte {
-	c.back--
-	c.len--
-	one := byte(c.back >> 4)
-	two := byte((c.back & 15) << 4)
-	return []byte{one, two | c.len}
+func (imo *InMemoryOutput) AddByteInHeader(kind byte) {
+	if imo.currentHeaderByteLen > 7 {
+		imo.Headers = append(imo.Headers, 0)
+		imo.currentHeaderByteLen = 0
+	}
+
+	imo.Headers[len(imo.Headers)-1] |= (kind << byte(imo.currentHeaderByteLen))
+	imo.currentHeaderByteLen++
 }
 
-const WINDOW_SIZE_IN_BYTES = 4096
+const BUF_CAP = 4096
 
-var buffer []Unit
-var window []Unit
+type Buffer struct {
+	Imo    InMemoryOutput
+	Buffer [BUF_CAP]byte
+	Len    int
+}
 
-var number_of_headers uint64
-var headers []byte
-var data []byte
+func NewBuffer() Buffer {
+	return Buffer{
+		Imo: NewInMemoryOutput(),
+	}
+}
+
+func (b *Buffer) WriteByte(c byte) {
+	b.Imo.AddByteInHeader(BYTE)
+	if b.Len >= BUF_CAP {
+		b.Imo.Data = append(b.Imo.Data, b.Buffer[:BUF_CAP]...)
+		b.Len = 0
+	}
+
+	b.Buffer[b.Len] = c
+	b.Len++
+}
+
+func (b *Buffer) WritePtr(ptr, size byte) {
+	b.Imo.AddByteInHeader(PTR)
+
+	if b.Len+2 > BUF_CAP {
+		b.Imo.Data = append(b.Imo.Data, b.Buffer[:BUF_CAP]...)
+		b.Len = 0
+	}
+
+	b.Buffer[b.Len] = ptr
+	b.Len++
+	b.Buffer[b.Len] = size
+	b.Len++
+}
+
+func (b Buffer) Flush() InMemoryOutput {
+	b.Imo.Data = append(b.Imo.Data, b.Buffer[:b.Len]...)
+
+	return b.Imo
+}
+
+type Input struct {
+	Data      []byte
+	LookAhead []byte
+}
+
+func NewInputFromFile(filename string) Input {
+	var i Input
+
+	data, err := ioutil.ReadFile(filename)
+	check(err)
+
+	i.Data = data
+
+	return i
+}
+
+func (i *Input) FillLookAhead() {
+	if i.Data == nil {
+		panic("i.Data is nil")
+	}
+
+	if len(i.Data) < 16 {
+		i.LookAhead = i.Data
+		return
+	}
+
+	i.LookAhead = i.Data[:16]
+}
+
+func Compare(l, r []byte) bool {
+	if l == nil || r == nil {
+		return false
+	} else if len(l) > len(r) {
+		return false
+	}
+
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (in *Input) Match(buf *Buffer) (bool, []byte, int, int) {
+	for i := len(in.LookAhead); i >= 0; i-- {
+		endOff := in.LookAhead[:i]
+		for k := 0; k < len(buf.Buffer); k++ {
+			if Compare(endOff, buf.Buffer[k:]) {
+				if len(endOff) < 3 {
+					return false, nil, 0, 0
+				}
+				return true, endOff, buf.Len - k, len(endOff)
+			}
+		}
+	}
+
+	return false, nil, 0, 0
+}
+
+func Loop(in *Input, buf *Buffer) InMemoryOutput {
+	for len(in.Data) != 0 {
+		in.FillLookAhead()
+		if len(in.LookAhead) == 0 {
+			break
+		}
+		matched, _, ptr, size := in.Match(buf)
+		if matched {
+			first, second := pack(ptr, size)
+			buf.WritePtr(first, second)
+			in.Data = in.Data[size:]
+		} else {
+			buf.WriteByte(in.LookAhead[0])
+			in.Data = in.Data[1:]
+		}
+	}
+
+	return buf.Flush()
+}
+
+// subtracting values by 1, u12 numbers range from 0 - 4095, we want to start from 1
+func pack(ptr, size int) (byte, byte) {
+	ptr--
+	size--
+	first := byte(ptr >> 4)
+	second := byte(((ptr & 15) << 4) | size)
+
+	return first, second
+}
+
+func unpack(first, second byte) (int, int) {
+	newfirst := (int(first) << 4) + int(second>>4)
+	newsecond := int(second & 15)
+
+	return newfirst + 1, newsecond + 1
+}
+
+func (in *InMemoryOutput) ToFile(filename string) {
+	f, err := os.Create("out.lzss")
+	check(err)
+	defer f.Close()
+
+	enc := gob.NewEncoder(f)
+	enc.Encode(in)
+}
+
+type Queue struct {
+	Data []byte
+}
+
+func NewQueue(cap int) Queue {
+	var q Queue
+
+	q.Data = make([]byte, 0, cap)
+
+	return q
+}
+
+func (q *Queue) Push(s []byte) {
+	q.Data = bytes.Join([][]byte{q.Data, s}, []byte{})
+}
+
+func DecompressFromFileToFile(filename string) {
+	f, err := os.Open(filename + ".lzss")
+	check(err)
+	defer f.Close()
+
+	var imo InMemoryOutput
+	decoder := gob.NewDecoder(f)
+	decoder.Decode(&imo)
+
+	pos := 0
+
+	queue := NewQueue(len(imo.Data))
+
+	for h := 0; h < len(imo.Headers)-1; h++ {
+		rename(&imo, &queue, &pos, imo.Headers[h], 8)
+	}
+
+	rename(&imo, &queue, &pos, imo.Headers[len(imo.Headers)-1], len(imo.Data)-pos)
+
+	out, err := os.Create(filename)
+	check(err)
+	defer out.Close()
+
+	out.Write(queue.Data)
+}
+
+func rename(imo *InMemoryOutput, queue *Queue, pos *int, h byte, cols int) {
+	for i := 0; *pos < len(imo.Data) && i < cols; i++ {
+		if h&(1<<i) != 0 {
+			ptr, size := unpack(imo.Data[*pos], imo.Data[*pos+1])
+
+			len_adjusted := imo.Data[*pos-ptr:][:size]
+
+			queue.Push(len_adjusted)
+			*pos += 2
+		} else {
+			queue.Push([]byte{imo.Data[*pos]})
+			*pos++
+		}
+	}
+}
+
+func Compress() {
+	b := NewBuffer()
+	i := NewInputFromFile("other")
+
+	imo := Loop(&i, &b)
+
+	imo.ToFile("out.lzss")
+
+}
+
+func testpacking(one, two int) {
+	x, y := pack(one, two)
+	q, w := unpack(x, y)
+
+	if q != one || w != two {
+		fmt.Println("failed", one, two, x, y, q, w)
+	}
+}
 
 func main() {
-	handle_command_line_args()
+	testpacking(4096, 16)
+	testpacking(2600, 16)
+	testpacking(1, 1)
+	testpacking(34, 16)
+
+	Compress()
+
+	DecompressFromFileToFile("out")
 }
 
-func handle_command_line_args() {
-	args := os.Args
-
-	if len(args) < 3 {
-		fmt.Println("Usage: lzss [-c or -d] [FILE]")
-		os.Exit(0)
-	}
-
-	filename := args[2]
-	
-	bytes, err := ioutil.ReadFile(filename)
-	panifer(err)
-		
-	if args[1] == "-d" {
-		if !strings.Contains(filename, ".lzss") {
-			fmt.Printf("file \"%s\" doesn't have .lzss extension \n")
-			return
-		}
-		
-		output := decompress(bytes)
-
-		out, err := os.Create(filename[:len(".lzss")] + ".out")
-		panifer(err)
-
-		out.Write(output)
-	} else if args[1] == "-c" {
-		bytes, err := ioutil.ReadFile(filename)
-		panifer(err)
-		
-		compress(filename + ".lzss", bytes)
-	} else {
-		fmt.Println("Usage: lzss [-c or -d] [FILE]")
-	}
-}
-
-func compress(output_filename string, original []byte) {
-	input := original
-	
-	for len(input) != 0 {
-		window = window_units_at_back_of_array(buffer)
-
-		cstrings := find_charstrs_in_window(window)
-
-		snippet := take16(input)
-		match, ptr := string_search(snippet, cstrings)
-		
-		if match == true && ptr.(Ptr).len == 2 {
-			add_string_to_buffer(snippet[:2])
-			input = input[2:]
-		} else if match == true {
-			v, ok := ptr.(Ptr)
-			if !ok {
-				panic("Supposed to be Ptr!")
-			}
-			input = input[v.len:]
-			buffer = append(buffer, v)
-		} else {
-			add_string_to_buffer(snippet[:1])
-			input = input[1:]
-		}
-	}
-	
-	encode_from_buffer()
-
-	f := create_file(output_filename)
-	defer func() {
-		panifer(f.Close())
-	}()
-	
-	write_to_file(f)
-}
-
-func decompress(data []byte) (ret []byte) {
-	number_of_headers, data = bytes_to_uint64(data)
-	headers = data[:number_of_headers]
-	data = data[number_of_headers:]
-
-	ret = make([]byte, 0, len(data) / 2)
-	index := 0
-	for _, h := range headers {
-		for i := 0; i < 8 && index < len(data); i++ {
-			is_ptr_flag := (h & (1 << i) != 0)
-			if is_ptr_flag == true {
-				back, l := unpack_ptr(data[index:])
-				str_start := index - int(back) 
-				str := data[str_start : str_start + int(l)]
-				for _, v := range str {
-					ret = append(ret, v)
-				}
-				index += 2
-			} else {
-				ret = append(ret, data[index])
-				index++
-			}
-		}
-	}
-
-	return ret
-}
-
-func unpack_ptr(d []byte) (back byte, l byte) {
-	d = d[:2]
-
-	back = (d[0] << 4) + (d[1] >> 4)
-	l = d[1] & 15
-
-	return back + 1 , l + 1
-}
-
-func uint64_to_bytes(i uint64) (r []byte) {
-	r = make([]byte, 8)
-
-	index := 0
-	for shift_by := 0; shift_by < 64; shift_by += 8 {
-		r[index] = byte(i >> shift_by)
-		index++
-	}
-
-	return r
-}
-
-func bytes_to_uint64(b []byte) (ri uint64, rb []byte) {
-	rb = b[8:]
-	b = b[:8]
-
-	for i := 0; i < 8; i++ {
-		ri += ( uint64(b[i]) << (i * 8) )
-	}
-
-	return ri, rb
-}
-
-func write_to_file(f *os.File) int {
-	w, err := f.Write(uint64_to_bytes(number_of_headers))
-	panifer(err)
-
-	w2, err := f.Write(headers)
-	panifer(err)
-
-	w3, err := f.Write(data)
-	panifer(err)
-
-	return w + w2 + w3
-}
-
-func add_string_to_buffer(input []byte) {
-	for _, c := range input {
-		buffer = append(buffer, Char{c})
-	}
-}
-
-func take16(s []byte) []byte {
-	if len(s) < 16 {
-		return s
-	}
-
-	return s[:16]
-}
-
-func window_units_at_back_of_array(units []Unit) []Unit {
-	bytes := 0
-
-	start := len(units)
-	
-	for i := len(units) - 1; i >= 0; i-- {
-		head := units[i]	
-		
-		switch head.(type) {
-		case Char:
-			bytes += 1
-		case Ptr:
-			bytes += 2
-		default:
-			panic("Impossible State!")
-		}
-
-		if bytes > WINDOW_SIZE_IN_BYTES {
-			return units[start:]
-		}
-		start--
-	}
-	
-	return units[start:]
-}
-
-func find_charstrs_in_window(window []Unit) (r []CharStr) {
-	for i := 0; i < len(window); i++ {		
-		switch v := window[i].(type) {
-		case Char:
-			var s CharStr
-			s.index = uint(i)
-			s.str = make([]Char, 0, 16)
-			s.str = append(s.str, v)
-			
-			for i++; i < len(window); i++ {
-				switch v := window[i].(type) {
-				case Char:
-					s.str = append(s.str, v)
-					continue
-				}
-
-				break
-			}
-
-			r = append(r, s)
-		}
-	}
-
-	return r
-}
-
-func strcmp(chars []byte, cs CharStr) (bool, CharStr) {
-	if len(chars) == 1 || len(cs.str) == 1 {
-		return false, CharStr{}
-	} else if len(chars) > len(cs.str) {
-		return false, CharStr{}
-	}
-		
-	for i := 0; i < len(chars); i++ {
-		if chars[i] != cs.str[i].v {
-			return false, cs
-		}
-	}
-	return true, cs 
-}
-
-func string_search(chars []byte, strs []CharStr) (bool, Unit) {
-	if len(chars) == 0 {
-		return false, Ptr{}
-	}
-
-	for ; len(chars) > 0; chars = chars[:len(chars)-1] {
-		for _, v := range strs {
-			for j := 0; j < len(v.str); j++ {
-				l := v
-				l.str = v.str[j:]
-				if b, cs := strcmp(chars, l); b {
-					return true, Ptr{window_len_in_bytes(window[cs.index + uint(j):]), byte(len(chars))}
-				}
-			}
-		}
-	}
-	
-	return false, Ptr{}
-}
-
-func window_len_in_bytes(window []Unit) (r uint) {
-	for i := 0; i < len(window); i++ {
-		switch window[i].(type) {
-		case Char:
-			r++
-		case Ptr:
-			r += 2
-		}
-	}
-
-	return r
-}
-
-func encode_from_buffer() {
-	for len(buffer) > 0 {
-		var h byte 
-		for i := 0; i < 8 && len(buffer) > 0; i++ {
-			var t byte = 0
-			head := buffer[0]
-			
-			switch head.(type) {
-			case Ptr:
-				t = 1				
-			}
-			h |= (t << i)
-
-			bytes := head.Bytes()
-			for _, v := range bytes {
-				data = append(data, v)
-			}
-			buffer = buffer[1:]
-		}
-
-		number_of_headers++
-		headers = append(headers, h)
-	}
-}
-
-func create_file(name string) *os.File {
-	file, err := os.Create(name)
-	panifer(err)
-
-	return file
-}
-
-func panifer(e error) {
+func check(e error) {
 	if e != nil {
 		panic(e)
 	}
