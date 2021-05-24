@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/gob"
 	"fmt"
 	"io/ioutil"
@@ -177,7 +176,7 @@ func unpack(first, second byte) (int, int) {
 }
 
 func (in *InMemoryOutput) ToFile(filename string) {
-	f, err := os.Create("out.lzss")
+	f, err := os.Create(filename + ".lzss")
 	check(err)
 	defer f.Close()
 
@@ -185,24 +184,8 @@ func (in *InMemoryOutput) ToFile(filename string) {
 	enc.Encode(in)
 }
 
-type Queue struct {
-	Data []byte
-}
-
-func NewQueue(cap int) Queue {
-	var q Queue
-
-	q.Data = make([]byte, 0, cap)
-
-	return q
-}
-
-func (q *Queue) Push(s []byte) {
-	q.Data = bytes.Join([][]byte{q.Data, s}, []byte{})
-}
-
-func DecompressFromFileToFile(filename string) {
-	f, err := os.Open(filename + ".lzss")
+func DecompressFromFileToFile(filename string, outputname string) {
+	f, err := os.Open(filename)
 	check(err)
 	defer f.Close()
 
@@ -212,65 +195,62 @@ func DecompressFromFileToFile(filename string) {
 
 	pos := 0
 
-	queue := NewQueue(len(imo.Data))
+	output := make([]byte, 0, 10000)
 
 	for h := 0; h < len(imo.Headers)-1; h++ {
-		rename(&imo, &queue, &pos, imo.Headers[h], 8)
+		output = readAndDecodeFromWithHeader(&imo, output, &pos, imo.Headers[h], 8)
 	}
 
-	rename(&imo, &queue, &pos, imo.Headers[len(imo.Headers)-1], len(imo.Data)-pos)
+	output = readAndDecodeFromWithHeader(&imo, output, &pos, imo.Headers[len(imo.Headers)-1], len(imo.Data)-pos)
 
-	out, err := os.Create(filename)
+	outfile, err := os.Create(outputname)
 	check(err)
-	defer out.Close()
+	defer outfile.Close()
 
-	out.Write(queue.Data)
+	outfile.Write(output)
 }
 
-func rename(imo *InMemoryOutput, queue *Queue, pos *int, h byte, cols int) {
+// a header is a byte where each bit can represent a one byte character or two byte ptr
+// ex. if the first bit in the very first header is 0 then the first byte of the compressed program is a char
+func readAndDecodeFromWithHeader(imo *InMemoryOutput, output []byte, pos *int, h byte, cols int) []byte {
 	for i := 0; *pos < len(imo.Data) && i < cols; i++ {
 		if h&(1<<i) != 0 {
 			ptr, size := unpack(imo.Data[*pos], imo.Data[*pos+1])
 
 			len_adjusted := imo.Data[*pos-ptr:][:size]
 
-			queue.Push(len_adjusted)
+			output = append(output, len_adjusted...)
 			*pos += 2
 		} else {
-			queue.Push([]byte{imo.Data[*pos]})
+			output = append(output, imo.Data[*pos])
 			*pos++
 		}
 	}
+
+	return output
 }
 
-func Compress() {
+func Compress(filename string) {
 	b := NewBuffer()
-	i := NewInputFromFile("other")
+	i := NewInputFromFile(filename)
 
 	imo := Loop(&i, &b)
 
-	imo.ToFile("out.lzss")
+	imo.ToFile(filename)
 
-}
-
-func testpacking(one, two int) {
-	x, y := pack(one, two)
-	q, w := unpack(x, y)
-
-	if q != one || w != two {
-		fmt.Println("failed", one, two, x, y, q, w)
-	}
 }
 
 func main() {
-	testpacking(4096, 16)
-	testpacking(2600, 16)
-	testpacking(1, 1)
-	testpacking(34, 16)
 
-	Compress()
+	args := os.Args
 
-	DecompressFromFileToFile("out")
+	if len(args) >= 4 && args[1] == "-d" {
+		DecompressFromFileToFile(args[2], args[3])
+	} else if len(args) >= 3 && args[1] == "-c" {
+		Compress(args[2])
+	} else {
+		fmt.Println("USAGE:\n\tlzss -c [FILE]\n\tlzss -d [INPUT] [OUTPUT]")
+	}
 }
 
 func check(e error) {
